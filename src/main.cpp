@@ -35,14 +35,16 @@ int getBitPosition(uint8_t value)
           (((value & 0xF0) != 0) << 2));
 }
 
+/**
+ * @brief Interrupt handler for when the row changed interrupt fires.
+ * 
+ */
 void rowChanged()
 {
-  if (currentState == WaitingForRelease)
+  if (currentState == WaitingForPress)
   {
-    return;
+    currentState = DetectionState::PressDetected;
   }
-
-  currentState = DetectionState::PressDetected;
 }
 
 void InitForRowDetection(bool setPullups)
