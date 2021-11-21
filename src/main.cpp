@@ -47,6 +47,12 @@ void rowChanged()
   }
 }
 
+/**
+ * @brief Initializes the MCP23017 to detect interrupts on row changes.
+ * 
+ * @param setPullups True if the pullup resistors should get configured. This only needs to happen once when the chip
+ * is first initialized at board startup.
+ */
 void InitForRowDetection(bool setPullups)
 {
   _mcp.writeRegister(MCP23017Register::IODIR_A, 0x00, 0xFF); // Columns as output, rows as input
