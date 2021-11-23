@@ -2,8 +2,10 @@
 #include <Wire.h>
 #include <MCP23017.h>
 
-#define MCP23017_I2C_ADDRESS 0x20 // I2C address of the MCP23017 IC
-#define INTA_PIN 2                // Row interrupts
+const uint8_t ROW_I2C_ADDRESS = 0x20;            // I2C address of the MCP23017 IC
+const uint8_t COLUMN_I2C_ADDRESS = 0x21;         // I2C address of the MCP23017 IC
+const uint8_t INTA_PIN = 2;                      // Row interrupts
+const uint16_t ROW_PULLUPS = 0b1111111111111100; // Pullups for the unconnected row pins. The high byte is PORTB, low byte PORTA.
 
 enum DetectionState
 {
@@ -16,7 +18,36 @@ volatile auto currentState = DetectionState::WaitingForPress;
 auto activeRow = 0;
 auto activeColumn = 0;
 
-MCP23017 _mcp(MCP23017_I2C_ADDRESS);
+MCP23017 rows(ROW_I2C_ADDRESS);
+MCP23017 columns(COLUMN_I2C_ADDRESS);
+
+void write16AsBits(uint16_t value)
+{
+  for (int i = 0; i < 8; i++)
+  {
+    bool b = value & 0x8000;
+    Serial.print(b);
+    value = value << 1;
+  }
+
+  Serial.print(" ");
+  for (int i = 0; i < 8; i++)
+  {
+    bool b = value & 0x8000;
+    Serial.print(b);
+    value = value << 1;
+  }
+}
+
+void write8AsBits(uint8_t value)
+{
+  for (int i = 0; i < 8; i++)
+  {
+    bool b = value & 0x80;
+    Serial.print(b);
+    value = value << 1;
+  }
+}
 
 /**
  * @brief Get the bit position for a single low bit in a byte.
@@ -24,15 +55,19 @@ MCP23017 _mcp(MCP23017_I2C_ADDRESS);
  * @param value The byte to check, with the active bit set to low and inactive bits set high
  * @return int The position of the single low bit in the byte
  */
-int getBitPosition(uint8_t value)
+int getBitPosition(uint16_t value)
 {
   // The entire key detection logic uses low for active so invert the bits
   // to ensure this magic works properly.
   value = ~value;
-  // value is in {1, 2, 4, 8, 16, 32, 64, 128}, returned values are {0, 1, ..., 7}
-  return (((value & 0xAA) != 0) |
-          (((value & 0xCC) != 0) << 1) |
-          (((value & 0xF0) != 0) << 2));
+  // value is a power of two, returned values are {0, 1, ..., 15}
+  // This is effectively calculating log2(n) since it's guaranteed there will only ever
+  // be one bit set in the value. It's a variation of the method shown
+  // at http://graphics.stanford.edu/~seander/bithacks.html#IntegerLog.
+  return (((value & 0xAAAAAAAA) != 0) |
+          (((value & 0xCCCCCCCC) != 0) << 1) |
+          (((value & 0xF0F0F0F0) != 0) << 2) |
+          (((value & 0xFF00FF00) != 0) << 3));
 }
 
 /**
@@ -55,22 +90,27 @@ void rowChanged()
  */
 void InitForRowDetection(bool setPullups)
 {
-  _mcp.writeRegister(MCP23017Register::IODIR_A, 0x00, 0xFF); // Columns as output, rows as input
-  _mcp.writeRegister(MCP23017Register::GPIO_A, 0x00, 0xFF);  // Reset columns to 0s and rows to 1s
+  columns.writeRegister(MCP23017Register::IODIR_A, 0x00, 0x00); // Columns as output
+  columns.writeRegister(MCP23017Register::GPIO_A, 0x00, 0x00);  // Reset columns to 0s
+  rows.writeRegister(MCP23017Register::IODIR_A, 0xFF, 0xFF);    // Rows as input
+  rows.writeRegister(MCP23017Register::GPIO_A, 0xFF, 0xFF);     // Reset rows to 1s
 
   if (setPullups)
   {
-    _mcp.writeRegister(MCP23017Register::GPPU_A, 0xFF, 0x00); // Columns have pull-up resistors on, rows have pull-up resistors off
+    columns.writeRegister(MCP23017Register::GPPU_A, 0xFF, 0xFF);                                     // Columns have pull-up resistors on
+    rows.writeRegister(MCP23017Register::GPPU_A, (uint8_t)ROW_PULLUPS, (uint8_t)(ROW_PULLUPS >> 8)); // Rows have pull-up resistors off for all
   }
 
-  _mcp.writeRegister(MCP23017Register::INTCON_A, 0x00, 0xFF); // Turn off interrupts for columns, on for rows
-  _mcp.writeRegister(MCP23017Register::DEFVAL_A, 0x00, 0xFF); // Default value of 0 for columns, 1 for rows
+  columns.writeRegister(MCP23017Register::INTCON_A, 0x00, 0x00); // Turn interrupts off for columns
+  columns.writeRegister(MCP23017Register::DEFVAL_A, 0x00, 0x00); // Default value of 0 for columns
+  rows.writeRegister(MCP23017Register::INTCON_A, 0xFF, 0xFF);    // Turn interrupts on for rows
+  rows.writeRegister(MCP23017Register::DEFVAL_A, 0xFF, 0xFF);    // Default value of 1 for rows
 
   // Turn on interrupts
-  _mcp.interruptMode(MCP23017InterruptMode::Or);         // Interrupt on one line
-  _mcp.writeRegister(MCP23017Register::GPINTEN_B, 0xFF); // Turn on the interrupts for the rows
+  rows.interruptMode(MCP23017InterruptMode::Or);               // Interrupt on one line
+  rows.writeRegister(MCP23017Register::GPINTEN_A, 0xFF, 0xFF); // Turn on the interrupts for the rows
 
-  _mcp.clearInterrupts(); // Clear all interrupts which could come from initialization
+  rows.clearInterrupts(); // Clear all interrupts which could come from initialization
 }
 
 void setup()
@@ -87,7 +127,8 @@ void setup()
   Serial.println("Waiting 5 seconds to begin.");
   delay(5000);
 
-  _mcp.init();
+  columns.init();
+  rows.init();
 
   // Set all the registers for proper interrupt detection on rows
   InitForRowDetection(true);
@@ -103,29 +144,33 @@ void setup()
  */
 void CheckForButton()
 {
-  uint8_t rowStates;
-  uint8_t columnStates;
+  uint16_t rowStates;
+  uint16_t columnStates;
 
-  // Read the row interrupts to find out which one caused the interrupt.
-  rowStates = _mcp.readRegister(MCP23017Register::INTCAP_B);
+  // Read the current state of all 16 row pins. PORTA will be the low byte,
+  // PORTB will be the high byte.
+  rowStates = rows.read();
 
   // Once the row is known reconfigure a bunch of registers to read the active column
-  _mcp.writeRegister(MCP23017Register::IODIR_A, 0xFF, 0x00);   // Switch columns to input, rows to output
-  _mcp.writeRegister(MCP23017Register::INTCON_A, 0xFF, 0x00);  // Turn on interrupts for columns, off for rows
-  _mcp.writeRegister(MCP23017Register::DEFVAL_A, 0xFF, 0x00);  // Default value of 1 for columns, 0 for rows
-  _mcp.writeRegister(MCP23017Register::GPINTEN_A, 0xFF, 0x00); // Temporarily enable column interrupts even though they aren't used, disable row interrupts
+  columns.writeRegister(MCP23017Register::IODIR_A, 0xFF, 0xFF);   // Switch columns to input
+  rows.writeRegister(MCP23017Register::IODIR_A, 0x00, 0x00);      // Switch rows to output
+  columns.writeRegister(MCP23017Register::INTCON_A, 0xFF, 0xFF);  // Turn interrupts on for columns
+  rows.writeRegister(MCP23017Register::INTCON_A, 0x00, 0x00);     // Turn interrupts off for rows
+  columns.writeRegister(MCP23017Register::DEFVAL_A, 0xFF, 0xFF);  // Default value of 1 for columns
+  rows.writeRegister(MCP23017Register::DEFVAL_A, 0x00, 0x00);     // Default value of 0 for rows
+  columns.writeRegister(MCP23017Register::GPINTEN_A, 0xFF, 0xFF); // Temporarily enable column interrupts even though they aren't used
+  rows.writeRegister(MCP23017Register::GPINTEN_A, 0x00, 0x00);    // Temporarily disable row interrupts
 
   // Write 0s to the rows then read the columns to find out what button is pressed.
-  _mcp.writePort(MCP23017Port::B, 0x00); //  This step is missing from the application note.
-  columnStates = _mcp.readPort(MCP23017Port::A);
+  // This step is missing from the application note.
+  rows.write(0x0000);
+
+  // Read the current state of all 16 column pins. PORTA will be the low byte,
+  // PORTB will be the high byte.
+  columnStates = columns.read();
 
   activeRow = getBitPosition(rowStates);
   activeColumn = getBitPosition(columnStates);
-
-  Serial.print("Detected press at row: ");
-  Serial.print(activeRow);
-  Serial.print(" column: ");
-  Serial.println(activeColumn);
 
   // Flip all the registers back to the default configuration to look for
   // when the row clears.
@@ -140,13 +185,13 @@ void CheckForButton()
  */
 void CheckForRelease()
 {
-  uint8_t rowState;
+  uint16_t rowState;
 
   // Try clearing the interrupts by reading the current state for the rows
-  rowState = _mcp.readPort(MCP23017Port::B);
+  rowState = rows.read();
 
   // If all the inputs for the row are back to 1s then the button was released
-  if (rowState == 0xFF)
+  if (rowState == 0xFFFF)
   {
     Serial.print("Detected release at row: ");
     Serial.print(activeRow);
